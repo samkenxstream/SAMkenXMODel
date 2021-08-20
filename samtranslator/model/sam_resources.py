@@ -24,7 +24,7 @@ from samtranslator.model.apigateway import (
 from samtranslator.model.apigatewayv2 import ApiGatewayV2Stage, ApiGatewayV2DomainName
 from samtranslator.model.cloudformation import NestedStack
 from samtranslator.model.s3 import S3Bucket
-from samtranslator.model.cloudwatch import SyntheticsCanary
+from samtranslator.model.cloudwatch import SyntheticsCanary, CloudWatchAlarm
 from samtranslator.model.dynamodb import DynamoDBTable
 from samtranslator.model.exceptions import InvalidEventException, InvalidResourceException
 from samtranslator.model.resource_policies import ResourcePolicies, PolicyTypes
@@ -59,6 +59,18 @@ from samtranslator.model.xray_utils import get_xray_managed_policy_name
 MAX_CANARY_LOGICAL_ID_LENGTH = 11
 MAX_CANARY_UNIQUE_ID_LENGTH = 5
 CANARY_NAME_PREFIX = "sam-"
+
+# The default values for ComparisonOperator, Threshold and Period based on the MetricName provided by the user
+# These default values were acquired from the Create Canary page in the Synthetics Canary dashboard
+# https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Synthetics_Canaries_metrics.html
+DEFAULT_METRIC_VALUES = {
+    "SuccessPercent": {"ComparisonOperator": "LessThanThreshold", "Threshold": 90, "Period": 300},
+    "Failed": {"ComparisonOperator": "GreaterThanOrEqualToThreshold", "Threshold": 1, "Period": 300},
+    "Duration": {"ComparisonOperator": "GreaterThanThreshold", "Threshold": 30000, "Period": 900},
+}
+# the main metrics produced by Synthetics Canary
+# sorted for backwards compatibility (python 2.7 automatically sorts keys)
+VALID_CANARY_METRICS = list(sorted(DEFAULT_METRIC_VALUES))
 
 
 class SamFunction(SamResourceMacro):
@@ -837,6 +849,7 @@ class SamCanary(SamResourceMacro):
         "VpcConfig": PropertyType(False, is_type(dict)),
         "Environment": PropertyType(False, dict_of(is_str(), is_type(dict))),
         "Policies": PropertyType(False, one_of(is_str(), is_type(dict), list_of(one_of(is_str(), is_type(dict))))),
+        "CanaryMetricAlarms": PropertyType(False, list_of(is_type(dict))),
     }
 
     def to_cloudformation(self, **kwargs):
@@ -867,7 +880,114 @@ class SamCanary(SamResourceMacro):
             resources.append(role)
             synthetics_canary.ExecutionRoleArn = role.get_runtime_attr("arn")
 
+        if self.CanaryMetricAlarms:
+            self._validate_cloudwatch_alarms()
+            for alarm_dict in self.CanaryMetricAlarms:
+                resources.append(self._construct_cloudwatch_alarm(alarm_dict))
+
         return resources
+
+    def _validate_cloudwatch_alarms(self):
+        """Validates the CanaryMetricAlarms property in Serverless Canary
+
+        The property should follow the following structure
+
+        CanaryMetricAlarms:
+            - AlarmName:
+                MetricName (required): one of the metrics in VALID_CANARY_METRICS
+                Threshold (optional): any value of type double
+                ComparisonOperator (optional): any of the valid values (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-cw-alarm.html#cfn-cloudwatch-alarms-comparisonoperator)
+                Period (optional): Integer that is 10, 30, 60, or any multiple of 60
+
+        Note: Alarm names are used as logical ids for their respective CloudWatchAlarm property so if user has multiple
+        alarms there should be no duplicate names as we don't want the alarms to override each other without the user's
+        knowledge
+
+        :raise: InvalidResourceException
+        """
+        # keeps list of alarm names to make sure there are no duplicates
+        list_of_alarm_names = []
+        for alarm_dict in self.CanaryMetricAlarms:
+
+            # Throw an error if there is more than one alarm in the array index, like for example
+            # CanaryMetricAlarms:
+            #     - Alarm1:
+            #         MetricName: SuccessPercent
+            #       Alarm2:
+            #         MetricName: SuccessPercent
+            #         Threshold: 90
+            #     - Alarm3:
+            #         MetricName: Failed
+            # throws an error for Alarm2 since its Alarm1 is already defined in that dict
+            if len(alarm_dict) != 1:
+                raise InvalidResourceException(self.logical_id, "Must have one alarm per array index")
+
+            # get the alarm name and the properties the user defined for the alarm
+            alarm_name = next(iter(alarm_dict))
+            alarm_item = alarm_dict[alarm_name]
+
+            # MetricName property is required
+            if alarm_item is None or "MetricName" not in alarm_item:
+                raise InvalidResourceException(
+                    self.logical_id,
+                    "CloudWatch alarm '{key}' is missing required property 'MetricName'.".format(key=alarm_name),
+                )
+
+            metric_name = alarm_item["MetricName"]
+
+            # MetricName must be one of the values in VALID_CANARY_METRICS
+            if metric_name not in VALID_CANARY_METRICS:
+                raise InvalidResourceException(
+                    self.logical_id,
+                    "MetricName needs to be one of {}".format(VALID_CANARY_METRICS),
+                )
+
+            # make sure all the alarm names are unique
+            if alarm_name in list_of_alarm_names:
+                raise InvalidResourceException(self.logical_id, "Duplicate CloudWatch alarm names")
+            else:
+                list_of_alarm_names.append(alarm_name)
+
+    def _construct_cloudwatch_alarm(self, alarm_dict):
+        """Constructs an CloudWatch::Alarm resource if the user specifies the CloudWatchAlarm property in Serverless Canary
+
+        :param dict alarm_dict: Alarm name and properties as provided by the customer
+        :returns: the generated CloudWatch Alarm
+        :rtype: model.cloudwatch.CloudWatchAlarm
+        """
+
+        # gets alarm name and the properties defined by user
+        alarm_name = next(iter(alarm_dict))
+        alarm_item = alarm_dict[alarm_name]
+
+        cloudwatch_alarm = CloudWatchAlarm(
+            logical_id=alarm_name,
+            depends_on=self.depends_on,
+            attributes=self.get_passthrough_resource_attributes(),
+        )
+
+        # default settings for the CloudWatch alarms
+        # the settings are identical to the Alarms that are made by Synthetics Canary using their dashboard
+        cloudwatch_alarm.MetricName = alarm_item["MetricName"]
+        cloudwatch_alarm.Namespace = "CloudWatchSynthetics"
+        cloudwatch_alarm.EvaluationPeriods = 1
+        cloudwatch_alarm.Statistic = "Sum"
+        cloudwatch_alarm.TreatMissingData = "notBreaching"
+        # connects the alarm to the metric produced by the Synthetics canary from this Serverless resource
+        cloudwatch_alarm.Dimensions = [{"Name": "CanaryName", "Value": {"Ref": self.logical_id}}]
+
+        # set the values if user provides them, if not set them to default value based on the MetricName
+        cloudwatch_alarm.ComparisonOperator = alarm_item.get(
+            "ComparisonOperator", DEFAULT_METRIC_VALUES[alarm_item["MetricName"]]["ComparisonOperator"]
+        )
+
+        cloudwatch_alarm.Threshold = float(
+            alarm_item.get("Threshold", DEFAULT_METRIC_VALUES[alarm_item["MetricName"]]["Threshold"])
+        )
+
+        cloudwatch_alarm.Period = alarm_item.get("Period", DEFAULT_METRIC_VALUES[alarm_item["MetricName"]]["Period"])
+
+        return cloudwatch_alarm
 
     def _construct_role(self, artifact_bucket_name, managed_policy_map):
         """Constructs an IAM:Role resource only if user doesn't specify Role property in Serverless Canary
